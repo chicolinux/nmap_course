@@ -1,3 +1,32 @@
+# Vagrant
+.vagrant/
+
+# Nmap output files
+*.nmap
+*.gnmap
+*.xml
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Instructor-only reference (solutions, notes)
+*-solution.nse
+*-solution.*
+instructor-notes/
+
 # Compiled Lua sources
 luac.out
 
@@ -38,4 +67,3 @@ luac.out
 *.i*86
 *.x86_64
 *.hex
-
