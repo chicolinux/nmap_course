@@ -1,0 +1,268 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 6 — El Arsenal: Nmap Scripting Engine (NSE)
+# 5 VMs con vulnerabilidades reales detectables por scripts NSE:
+#   sslweak   192.168.56.10 — HTTPS con TLS 1.0/1.1 y ciphers débiles
+#   samba     192.168.56.11 — Samba con share público sin autenticación
+#   httpvuln  192.168.56.12 — Apache con dir listing, .git expuesto, server-status
+#   sshweak   192.168.56.13 — SSH con password débil y PermitRootLogin
+#   snmppub   192.168.56.14 — SNMP con community string 'public' (default)
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+
+  # ─── VM 1: sslweak — TLS 1.0/1.1, ciphers débiles ──────────────────────────
+  # NSE relevante: ssl-enum-ciphers, ssl-cert, ssl-dh-params
+  config.vm.define "sslweak" do |s|
+    s.vm.box = ALPINE_BOX
+    s.vm.hostname = "kronos-sslweak"
+    s.vm.network "private_network", ip: "192.168.56.10"
+    s.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep6-sslweak"
+    end
+    s.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx openssl
+
+      # Certificado con RSA 1024-bit (débil — solo educativo)
+      mkdir -p /etc/ssl/private /etc/ssl/certs
+      openssl req -x509 -nodes -days 365 -newkey rsa:1024 \
+        -keyout /etc/ssl/private/weak.key \
+        -out /etc/ssl/certs/weak.crt \
+        -subj "/CN=kronos-legacy/O=Kronos Systems/OU=Legacy Infrastructure" 2>/dev/null
+
+      # nginx con TLS 1.0 + 1.1 habilitados (protocolos deprecados)
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    server {
+        listen 80;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name _;
+        ssl_certificate /etc/ssl/certs/weak.crt;
+        ssl_certificate_key /etc/ssl/private/weak.key;
+
+        # Protocolos deprecados habilitados intencionalmente
+        ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+
+        # Cipher suites con debilidades conocidas
+        ssl_ciphers 'DES-CBC3-SHA:AES128-SHA:AES256-SHA:DHE-RSA-AES128-SHA:!aNULL:!eNULL';
+        ssl_prefer_server_ciphers on;
+
+        root /var/www/html;
+        index index.html;
+    }
+}
+NGINX
+
+      mkdir -p /var/www/html
+      cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html>
+<html><head><title>Kronos Legacy Portal</title></head>
+<body>
+  <h1>Kronos Systems — Legacy Portal</h1>
+  <p>Este servidor corre sobre infraestructura heredada.</p>
+  <p>SSL configurado por el equipo original en 2010.</p>
+</body></html>
+HTML
+
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+
+  # ─── VM 2: samba — Share SMB sin autenticación ───────────────────────────────
+  # NSE relevante: smb-security-mode, smb-enum-shares, smb-enum-users
+  config.vm.define "samba" do |sm|
+    sm.vm.box = ALPINE_BOX
+    sm.vm.hostname = "kronos-samba"
+    sm.vm.network "private_network", ip: "192.168.56.11"
+    sm.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep6-samba"
+    end
+    sm.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache samba
+
+      mkdir -p /srv/samba/public /srv/samba/confidential
+      echo "RED CELL — Found it! This is the Kronos public share." \
+        > /srv/samba/public/YOU_FOUND_IT.txt
+      echo "Q4 2024 Budget: $47.3M surveillance contracts" \
+        > /srv/samba/public/kronos_public_docs.txt
+      echo "KRONOS PROJECT ZEUS — CLASSIFIED" \
+        > /srv/samba/confidential/project_zeus.txt
+
+      cat > /etc/samba/smb.conf << 'SMB'
+[global]
+   workgroup = KRONOS
+   server string = Kronos File Server
+   security = user
+   map to guest = bad user
+   guest account = nobody
+   log level = 1
+
+[public]
+   path = /srv/samba/public
+   comment = Kronos Public Documents
+   browseable = yes
+   read only = no
+   guest ok = yes
+   force user = nobody
+
+[confidential]
+   path = /srv/samba/confidential
+   comment = Confidential — Auth Required
+   browseable = no
+   read only = yes
+   guest ok = no
+   valid users = kronos_admin
+SMB
+
+      rc-update add samba default
+      rc-service samba start
+    SHELL
+  end
+
+  # ─── VM 3: httpvuln — Apache con múltiples misconfiguraciones ────────────────
+  # NSE relevante: http-git, http-title, http-server-header, http-enum, http-methods
+  config.vm.define "httpvuln" do |hv|
+    hv.vm.box = ALPINE_BOX
+    hv.vm.hostname = "kronos-httpvuln"
+    hv.vm.network "private_network", ip: "192.168.56.12"
+    hv.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep6-httpvuln"
+    end
+    hv.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache apache2
+
+      # Exponer versión completa de Apache
+      echo 'ServerTokens Full' >> /etc/apache2/httpd.conf
+      echo 'ServerSignature On' >> /etc/apache2/httpd.conf
+
+      # Document root con contenido vulnerable
+      mkdir -p /var/www/html/{.git,backup,logs,admin}
+
+      # Simular repositorio git expuesto
+      cat > /var/www/html/.git/HEAD << 'GIT'
+ref: refs/heads/main
+GIT
+      cat > /var/www/html/.git/config << 'GIT'
+[core]
+  repositoryformatversion = 0
+  filemode = true
+[remote "origin"]
+  url = git@github.com:kronos-internal/surveillance-platform.git
+  fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+  remote = origin
+  merge = refs/heads/main
+GIT
+
+      # Archivos de backup "olvidados"
+      echo "DB_PASSWORD=Kron0sDB#2024!" > /var/www/html/backup/config.bak
+      echo "API_KEY=sk-kronos-7f3a9b2c1d4e5f6a7b8c" >> /var/www/html/backup/config.bak
+      echo "SMTP_PASS=M@ilPass2024" >> /var/www/html/backup/config.bak
+      echo "admin:Kron0sAdmin#1" > /var/www/html/backup/credentials.txt
+
+      cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html>
+<html><head><title>Kronos Web Platform</title></head>
+<body>
+  <h1>Kronos Systems — Internal Web Platform</h1>
+  <p>Version 3.2.1 | Build 2024.09.15</p>
+  <ul>
+    <li><a href="/admin/">Admin Panel</a></li>
+    <li><a href="/backup/">Backups</a></li>
+    <li><a href="/logs/">Logs</a></li>
+  </ul>
+</body></html>
+HTML
+
+      # Habilitar directory listing y server-status
+      cat >> /etc/apache2/httpd.conf << 'APACHE'
+<Directory /var/www/html>
+    Options Indexes FollowSymLinks
+    AllowOverride None
+    Require all granted
+</Directory>
+
+ExtendedStatus On
+<Location /server-status>
+    SetHandler server-status
+    Require all granted
+</Location>
+APACHE
+
+      rc-update add apache2 default
+      rc-service apache2 start
+    SHELL
+  end
+
+  # ─── VM 4: sshweak — SSH con autenticación débil ────────────────────────────
+  # NSE relevante: ssh-brute, ssh-auth-methods, ssh-hostkey
+  config.vm.define "sshweak" do |sw|
+    sw.vm.box = ALPINE_BOX
+    sw.vm.hostname = "kronos-sshweak"
+    sw.vm.network "private_network", ip: "192.168.56.13"
+    sw.vm.provider "virtualbox" do |vb|
+      vb.memory = 256; vb.cpus = 1; vb.name = "ep6-sshweak"
+    end
+    sw.vm.provision "shell", inline: <<~SHELL
+      # Configurar SSH con opciones inseguras (solo educativo)
+      sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+      # Credenciales débiles
+      echo "root:admin123" | chpasswd
+      echo "kronos:kronos" | chpasswd
+
+      # Crear usuario kronos si no existe
+      id kronos >/dev/null 2>&1 || adduser -D -s /bin/sh kronos
+      echo "kronos:kronos" | chpasswd
+
+      rc-service sshd restart
+    SHELL
+  end
+
+  # ─── VM 5: snmppub — SNMP con community 'public' ────────────────────────────
+  # NSE relevante: snmp-info, snmp-interfaces, snmp-processes, snmp-sysdescr
+  config.vm.define "snmppub" do |sp|
+    sp.vm.box = ALPINE_BOX
+    sp.vm.hostname = "kronos-snmp"
+    sp.vm.network "private_network", ip: "192.168.56.14"
+    sp.vm.provider "virtualbox" do |vb|
+      vb.memory = 256; vb.cpus = 1; vb.name = "ep6-snmppub"
+    end
+    sp.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache net-snmp net-snmp-tools
+
+      mkdir -p /etc/snmp
+      cat > /etc/snmp/snmpd.conf << 'SNMP'
+# Community string 'public' — configuración por defecto insegura
+rocommunity public default
+rocommunity public 192.168.56.0/24
+
+# Información del sistema (expuesta)
+sysLocation    Kronos HQ — Data Center Floor 3 — Rack C7
+sysContact     sysadmin@kronos.internal (ext. 4821)
+sysDescr       Kronos Systems Network Appliance v4.2 — Production
+SNMP
+
+      rc-update add snmpd default
+      rc-service snmpd start
+    SHELL
+  end
+
+end

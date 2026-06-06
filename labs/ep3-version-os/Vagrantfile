@@ -1,0 +1,198 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 3 — Identidades: ¿Qué Hay Detrás de los Puertos?
+# 4 VMs con servicios variados y versiones detectables por nmap -sV / -O
+#   apache  192.168.56.10 — Apache2 (80), SSH (22)
+#   mail    192.168.56.11 — Postfix/SMTP (25), Dovecot/IMAP (143), POP3 (110), SSH (22)
+#   db      192.168.56.12 — MariaDB (3306), PostgreSQL (5432), SSH (22)
+#   multi   192.168.56.13 — vsftpd (21), nginx (8080), BIND/DNS (53), SSH (22)
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+
+  # ─── VM 1: apache — Apache2 con version headers ─────────────────────────────
+  config.vm.define "apache" do |a|
+    a.vm.box = ALPINE_BOX
+    a.vm.hostname = "kronos-apache"
+    a.vm.network "private_network", ip: "192.168.56.10"
+    a.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep3-apache"
+    end
+    a.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache apache2
+
+      # Habilitar headers de versión (inseguro — para propósito educativo)
+      # ServerTokens Full expone: Apache/2.x.x (Alpine Linux)
+      echo 'ServerTokens Full' >> /etc/apache2/httpd.conf
+      echo 'ServerSignature On' >> /etc/apache2/httpd.conf
+
+      mkdir -p /var/www/html
+      cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html>
+<html>
+<head><title>Kronos Apache</title></head>
+<body>
+  <h1>Kronos Systems — Web Application Server</h1>
+  <p>Running internal applications. Version info exposed for legacy compatibility.</p>
+</body>
+</html>
+HTML
+
+      # Habilitar server-status (expone información del servidor)
+      cat >> /etc/apache2/httpd.conf << 'APACHE'
+ExtendedStatus On
+<Location /server-status>
+    SetHandler server-status
+    Require all granted
+</Location>
+APACHE
+
+      rc-update add apache2 default
+      rc-service apache2 start
+    SHELL
+  end
+
+  # ─── VM 2: mail — SMTP + IMAP + POP3 ───────────────────────────────────────
+  config.vm.define "mail" do |m|
+    m.vm.box = ALPINE_BOX
+    m.vm.hostname = "kronos-mail"
+    m.vm.network "private_network", ip: "192.168.56.11"
+    m.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep3-mail"
+    end
+    m.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache postfix dovecot dovecot-pop3d dovecot-openrc
+
+      # --- Postfix (SMTP en puerto 25) ---
+      postconf -e 'myhostname = kronos-mail.kronos.internal'
+      postconf -e 'mydomain = kronos.internal'
+      postconf -e 'inet_interfaces = all'
+      postconf -e 'smtpd_banner = $myhostname ESMTP Postfix'
+      rc-update add postfix default
+      rc-service postfix start
+
+      # --- Dovecot (IMAP 143, POP3 110) ---
+      # Configuración básica que expone versión en el banner
+      cat > /etc/dovecot/dovecot.conf << 'DOVECOT'
+protocols = imap pop3
+listen = *
+mail_location = mbox:~/mail:INBOX=/var/mail/%u
+passdb {
+  driver = pam
+}
+userdb {
+  driver = passwd
+}
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+}
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+}
+DOVECOT
+      rc-update add dovecot default
+      rc-service dovecot start
+    SHELL
+  end
+
+  # ─── VM 3: db — MariaDB + PostgreSQL ────────────────────────────────────────
+  config.vm.define "db" do |db|
+    db.vm.box = ALPINE_BOX
+    db.vm.hostname = "kronos-db"
+    db.vm.network "private_network", ip: "192.168.56.12"
+    db.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep3-db"
+    end
+    db.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache mariadb mariadb-client postgresql postgresql-client
+
+      # --- MariaDB ---
+      mysql_install_db --user=mysql --datadir=/var/lib/mysql --skip-name-resolve >/dev/null 2>&1
+      # Comentar skip-networking para habilitar conexiones TCP
+      sed -i 's/^\s*skip-networking/#skip-networking/' /etc/my.cnf.d/mariadb-server.cnf
+      printf '\n[mysqld]\nbind-address=0.0.0.0\n' >> /etc/my.cnf.d/mariadb-server.cnf
+      rc-update add mariadb default
+      rc-service mariadb start
+
+      # --- PostgreSQL ---
+      # Iniciar primero para que el init script cree el data dir correcto
+      rc-update add postgresql default
+      rc-service postgresql start
+      sleep 3
+      # Obtener la ruta real del config desde PostgreSQL
+      PGCONF=$(su - postgres -c "psql -t -c 'SHOW config_file;'" 2>/dev/null | xargs)
+      PGHBA=$(su - postgres -c "psql -t -c 'SHOW hba_file;'" 2>/dev/null | xargs)
+      if [ -n "$PGCONF" ]; then
+        sed -i "s|#listen_addresses = 'localhost'|listen_addresses = '*'|" "$PGCONF"
+        echo "host all all 192.168.56.0/24 trust" >> "$PGHBA"
+        rc-service postgresql restart
+      fi
+    SHELL
+  end
+
+  # ─── VM 4: multi — Múltiples servicios en puertos no estándar ───────────────
+  config.vm.define "multi" do |mu|
+    mu.vm.box = ALPINE_BOX
+    mu.vm.hostname = "kronos-multi"
+    mu.vm.network "private_network", ip: "192.168.56.13"
+    mu.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep3-multi"
+    end
+    mu.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache vsftpd nginx bind
+
+      # --- FTP (21) ---
+      mkdir -p /var/ftp/pub
+      echo "Kronos FTP Archive" > /var/ftp/pub/README.txt
+      cat > /etc/vsftpd/vsftpd.conf << 'FTP'
+listen=YES
+anonymous_enable=YES
+local_enable=NO
+write_enable=NO
+anon_root=/var/ftp/pub
+FTP
+      rc-update add vsftpd default
+      rc-service vsftpd start
+
+      # --- nginx en puerto 8080 (no estándar) ---
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server {
+        listen 8080;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+}
+NGINX
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Internal App (port 8080)</h1></body></html>' \
+        > /var/www/html/index.html
+      rc-update add nginx default
+      rc-service nginx start
+
+      # --- BIND (DNS 53 TCP/UDP) ---
+      cat > /etc/bind/named.conf << 'BIND'
+options {
+    directory "/var/bind";
+    listen-on { any; };
+    allow-query { any; };
+    recursion yes;
+};
+BIND
+      rc-update add named default
+      rc-service named start
+    SHELL
+  end
+
+end

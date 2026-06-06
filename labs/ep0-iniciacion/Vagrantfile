@@ -1,0 +1,54 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 0 — Iniciación
+# Una sola VM: kronos-node-01
+# Servicios: SSH (22), HTTP (80)
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+  config.vm.define "target" do |t|
+    t.vm.box = ALPINE_BOX
+    t.vm.hostname = "kronos-node-01"
+    t.vm.network "private_network", ip: "192.168.56.10"
+
+    t.vm.provider "virtualbox" do |vb|
+      vb.memory = 512
+      vb.cpus = 1
+      vb.name = "ep0-target"
+    end
+
+    t.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx
+
+      mkdir -p /var/www/html
+      cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html>
+<html>
+<head><title>Kronos Systems</title></head>
+<body>
+  <h1>Kronos Systems — Internal Portal</h1>
+  <p>Authorized access only. All sessions are monitored and recorded.</p>
+  <p>Contact: security@kronos.internal | Node: kronos-node-01</p>
+</body>
+</html>
+HTML
+
+      cat > /etc/nginx/http.d/default.conf << 'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+NGINX
+
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+end

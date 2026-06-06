@@ -1,0 +1,170 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 2 — Las Puertas del Bastión: Escaneo de Puertos
+# 4 VMs que demuestran diferentes estados de puertos:
+#   web      192.168.56.10 — HTTP (80), HTTPS (443), SSH (22) — puertos OPEN
+#   ftp      192.168.56.11 — FTP (21), SSH (22) — puertos OPEN
+#   db       192.168.56.12 — MySQL (3306), Redis (6379), SSH (22) — OPEN pero sensibles
+#   filtered 192.168.56.13 — SSH (22) abierto; resto: DROP (filtered) o REJECT (closed)
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+
+  # ─── VM 1: web — HTTP + HTTPS ───────────────────────────────────────────────
+  config.vm.define "web" do |web|
+    web.vm.box = ALPINE_BOX
+    web.vm.hostname = "kronos-web"
+    web.vm.network "private_network", ip: "192.168.56.10"
+    web.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep2-web"
+    end
+    web.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx openssl
+
+      # Generar certificado auto-firmado para HTTPS
+      mkdir -p /etc/ssl/private /etc/ssl/certs
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx.key \
+        -out /etc/ssl/certs/nginx.crt \
+        -subj "/CN=kronos-web/O=Kronos Systems/C=US" 2>/dev/null
+
+      # Configurar nginx con HTTP y HTTPS
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    server {
+        listen 80;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name _;
+        ssl_certificate /etc/ssl/certs/nginx.crt;
+        ssl_certificate_key /etc/ssl/private/nginx.key;
+        root /var/www/html;
+        index index.html;
+    }
+}
+NGINX
+
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Web Portal</h1></body></html>' \
+        > /var/www/html/index.html
+
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+
+  # ─── VM 2: ftp — FTP anónimo ────────────────────────────────────────────────
+  config.vm.define "ftp" do |ftp|
+    ftp.vm.box = ALPINE_BOX
+    ftp.vm.hostname = "kronos-ftp"
+    ftp.vm.network "private_network", ip: "192.168.56.11"
+    ftp.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep2-ftp"
+    end
+    ftp.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache vsftpd
+
+      mkdir -p /var/ftp/pub
+      cat > /var/ftp/pub/README.txt << 'TXT'
+Kronos Systems — Internal FTP Repository
+Confidential. Unauthorized access prohibited.
+TXT
+
+      cat > /etc/vsftpd/vsftpd.conf << 'FTP'
+listen=YES
+anonymous_enable=YES
+local_enable=NO
+write_enable=NO
+anon_root=/var/ftp/pub
+xferlog_enable=YES
+FTP
+
+      rc-update add vsftpd default
+      rc-service vsftpd start
+    SHELL
+  end
+
+  # ─── VM 3: db — MySQL + Redis ───────────────────────────────────────────────
+  config.vm.define "db" do |db|
+    db.vm.box = ALPINE_BOX
+    db.vm.hostname = "kronos-db"
+    db.vm.network "private_network", ip: "192.168.56.12"
+    db.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep2-db"
+    end
+    db.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache mariadb mariadb-client redis
+
+      # --- MariaDB ---
+      mysql_install_db --user=mysql --datadir=/var/lib/mysql --skip-name-resolve >/dev/null 2>&1
+      # Escuchar en todas las interfaces (no solo localhost)
+      sed -i 's/^skip-networking/#skip-networking/' /etc/my.cnf.d/mariadb-server.cnf 2>/dev/null || true
+      if ! grep -q 'bind-address' /etc/my.cnf.d/mariadb-server.cnf 2>/dev/null; then
+        printf '\n[mysqld]\nbind-address=0.0.0.0\n' >> /etc/my.cnf.d/mariadb-server.cnf
+      fi
+      rc-update add mariadb default
+      rc-service mariadb start
+
+      # --- Redis ---
+      sed -i 's/^bind 127.0.0.1.*/bind 0.0.0.0/' /etc/redis.conf
+      sed -i 's/^protected-mode yes/protected-mode no/' /etc/redis.conf
+      rc-update add redis default
+      rc-service redis start
+    SHELL
+  end
+
+  # ─── VM 4: filtered — Demostración de estados filtered / closed ─────────────
+  config.vm.define "filtered" do |f|
+    f.vm.box = ALPINE_BOX
+    f.vm.hostname = "kronos-filtered"
+    f.vm.network "private_network", ip: "192.168.56.13"
+    f.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep2-filtered"
+    end
+    f.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache iptables
+
+      # Reglas de firewall para demostrar diferentes estados de puertos:
+      #   Puerto 22   → ACCEPT (open — SSH necesario para Vagrant)
+      #   Puerto 80   → REJECT con RST (closed — host rechaza la conexión)
+      #   Puerto 443  → DROP (filtered — sin respuesta, nmap no puede determinar estado)
+      #   Puerto 8080 → DROP (filtered)
+      #   Todo lo demás → DROP (filtered)
+
+      iptables -F INPUT
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      iptables -A INPUT -p icmp -j ACCEPT
+      iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+      iptables -A INPUT -p tcp --dport 80  -j REJECT --reject-with tcp-reset
+      iptables -A INPUT -p tcp --dport 443 -j DROP
+      iptables -A INPUT -p tcp --dport 8080 -j DROP
+      iptables -A INPUT -j DROP
+
+      # Persistir reglas al reinicio
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+
+      mkdir -p /etc/local.d
+      cat > /etc/local.d/iptables.start << 'LOCAL'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+LOCAL
+      chmod +x /etc/local.d/iptables.start
+      rc-update add local default
+    SHELL
+  end
+
+end

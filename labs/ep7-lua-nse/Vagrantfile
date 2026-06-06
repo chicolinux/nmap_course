@@ -1,0 +1,189 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 7 — Código de Sombra: Lua y NSE Avanzado
+# 4 VMs: 3 nodos normales + 1 con el backdoor PROMETHEUS-GATE en puerto 31337
+#   node1    192.168.56.10 — SSH (22), HTTP (80)
+#   node2    192.168.56.11 — SSH (22), FTP (21), MySQL (3306)
+#   node3    192.168.56.12 — SSH (22), HTTP (80), HTTPS (443)
+#   backdoor 192.168.56.13 — SSH (22), KRONOS-GATE (31337)
+#
+# El script fake-backdoor-server.py se copia desde /vagrant/ (directorio del Vagrantfile)
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+
+  # ─── VM 1: node1 — SSH + HTTP ───────────────────────────────────────────────
+  config.vm.define "node1" do |n|
+    n.vm.box = ALPINE_BOX
+    n.vm.hostname = "kronos-node1"
+    n.vm.network "private_network", ip: "192.168.56.10"
+    n.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep7-node1"
+    end
+    n.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Node Alpha</h1></body></html>' \
+        > /var/www/html/index.html
+      cat > /etc/nginx/http.d/default.conf << 'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}
+NGINX
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+
+  # ─── VM 2: node2 — SSH + FTP + MySQL ────────────────────────────────────────
+  config.vm.define "node2" do |n|
+    n.vm.box = ALPINE_BOX
+    n.vm.hostname = "kronos-node2"
+    n.vm.network "private_network", ip: "192.168.56.11"
+    n.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep7-node2"
+    end
+    n.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache vsftpd mariadb mariadb-client
+
+      # FTP
+      mkdir -p /var/ftp/pub
+      echo "Kronos Node Beta Archive" > /var/ftp/pub/README.txt
+      cat > /etc/vsftpd/vsftpd.conf << 'FTP'
+listen=YES
+anonymous_enable=YES
+local_enable=NO
+write_enable=NO
+anon_root=/var/ftp/pub
+FTP
+      rc-update add vsftpd default
+      rc-service vsftpd start
+
+      # MariaDB
+      mysql_install_db --user=mysql --datadir=/var/lib/mysql --skip-name-resolve >/dev/null 2>&1
+      sed -i 's/^\s*skip-networking/#skip-networking/' /etc/my.cnf.d/mariadb-server.cnf
+      printf '\n[mysqld]\nbind-address=0.0.0.0\n' >> /etc/my.cnf.d/mariadb-server.cnf
+      rc-update add mariadb default
+      rc-service mariadb start
+    SHELL
+  end
+
+  # ─── VM 3: node3 — SSH + HTTP + HTTPS ───────────────────────────────────────
+  config.vm.define "node3" do |n|
+    n.vm.box = ALPINE_BOX
+    n.vm.hostname = "kronos-node3"
+    n.vm.network "private_network", ip: "192.168.56.12"
+    n.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep7-node3"
+    end
+    n.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx openssl
+
+      mkdir -p /etc/ssl/private /etc/ssl/certs
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx.key \
+        -out /etc/ssl/certs/nginx.crt \
+        -subj "/CN=kronos-node3" 2>/dev/null
+
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server {
+        listen 80;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+    server {
+        listen 443 ssl;
+        server_name _;
+        ssl_certificate /etc/ssl/certs/nginx.crt;
+        ssl_certificate_key /etc/ssl/private/nginx.key;
+        root /var/www/html;
+        index index.html;
+    }
+}
+NGINX
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Node Gamma</h1></body></html>' \
+        > /var/www/html/index.html
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+
+  # ─── VM 4: backdoor — PROMETHEUS-GATE en puerto 31337 ───────────────────────
+  config.vm.define "backdoor" do |b|
+    b.vm.box = ALPINE_BOX
+    b.vm.hostname = "kronos-backdoor"
+    b.vm.network "private_network", ip: "192.168.56.13"
+    b.vm.provider "virtualbox" do |vb|
+      vb.memory = 256; vb.cpus = 1; vb.name = "ep7-backdoor"
+    end
+    b.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache python3
+
+      # Escribir el servidor de backdoor directamente (no usar synced folder)
+      cat > /usr/local/bin/prometheus-gate.py << 'PYEOF'
+import socket, threading, sys
+from datetime import datetime
+
+PORT = 31337
+HANDSHAKE = b"KRONOS" + bytes([0, 1])
+RESPONSE  = b"PROMETHEUS-GATE v2.3.1" + bytes([0]) + b"READY"
+DENIED    = b"UNAUTHORIZED" + bytes([0])
+
+def log(m):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
+
+def handle(conn):
+    try:
+        data = conn.recv(64)
+        if data == HANDSHAKE:
+            conn.sendall(RESPONSE)
+            log(f"HANDSHAKE CORRECTO — backdoor identificado")
+        else:
+            conn.sendall(DENIED)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", PORT))
+    srv.listen(10)
+    log(f"PROMETHEUS-GATE v2.3.1 escuchando en :{PORT}")
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+
+      # Crear script de inicio para el servicio
+      mkdir -p /etc/local.d
+      cat > /etc/local.d/prometheus-gate.start << 'LOCAL'
+#!/bin/sh
+pkill -f prometheus-gate.py 2>/dev/null; sleep 1
+nohup python3 /usr/local/bin/prometheus-gate.py \
+  > /var/log/prometheus-gate.log 2>&1 &
+echo $! > /run/prometheus-gate.pid
+LOCAL
+      chmod +x /etc/local.d/prometheus-gate.start
+
+      rc-update add local default
+      /etc/local.d/prometheus-gate.start
+      sleep 1
+      echo "PROMETHEUS-GATE iniciado en puerto 31337"
+    SHELL
+  end
+
+end

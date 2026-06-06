@@ -1,0 +1,262 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 5 — El Mapa Completo: Técnicas Avanzadas y Outputs
+# 6 VMs con servicios UDP, protocolos avanzados y configuraciones de firewall variadas:
+#   snmp     192.168.56.10 — SNMP UDP 161, SSH 22
+#   dns      192.168.56.11 — BIND DNS TCP/UDP 53, SSH 22
+#   ntp      192.168.56.12 — NTP UDP 123, SSH 22
+#   nfs      192.168.56.13 — NFS TCP 2049, SSH 22
+#   acktgt   192.168.56.14 — Firewall stateless (target para ACK scan)
+#   mixed    192.168.56.15 — HTTP 80, HTTPS 443, MySQL 3306, puertos custom
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+
+  # ─── VM 1: snmp — SNMP sobre UDP ────────────────────────────────────────────
+  config.vm.define "snmp" do |s|
+    s.vm.box = ALPINE_BOX
+    s.vm.hostname = "kronos-snmp"
+    s.vm.network "private_network", ip: "192.168.56.10"
+    s.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep5-snmp"
+    end
+    s.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache net-snmp net-snmp-tools
+
+      # Configuración básica de snmpd con community string 'public'
+      mkdir -p /etc/snmp
+      cat > /etc/snmp/snmpd.conf << 'SNMP'
+rocommunity public default
+rocommunity public 192.168.56.0/24
+sysLocation    Kronos Data Center — Rack A3
+sysContact     netops@kronos.internal
+sysDescr       Kronos Systems Network Node
+SNMP
+
+      rc-update add snmpd default
+      rc-service snmpd start
+    SHELL
+  end
+
+  # ─── VM 2: dns — BIND (DNS TCP/UDP 53) ─────────────────────────────────────
+  config.vm.define "dns" do |d|
+    d.vm.box = ALPINE_BOX
+    d.vm.hostname = "kronos-dns"
+    d.vm.network "private_network", ip: "192.168.56.11"
+    d.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep5-dns"
+    end
+    d.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache bind bind-tools
+
+      # Crear named.conf completo (Alpine no incluye uno por defecto)
+      cat > /etc/bind/named.conf << 'BIND'
+options {
+    directory "/var/bind";
+    listen-on { any; };
+    allow-query { any; };
+    allow-transfer { any; };
+    recursion yes;
+};
+
+zone "kronos.internal" IN {
+    type master;
+    file "/etc/bind/kronos.internal.zone";
+    allow-transfer { any; };
+};
+BIND
+
+      cat > /etc/bind/kronos.internal.zone << 'ZONE'
+$TTL 86400
+@   IN  SOA     ns1.kronos.internal. admin.kronos.internal. (
+                2024010101 ; serial
+                3600       ; refresh
+                1800       ; retry
+                604800     ; expire
+                86400 )    ; minimum TTL
+
+    IN  NS      ns1.kronos.internal.
+
+ns1     IN  A   192.168.56.11
+web     IN  A   192.168.56.10
+mail    IN  A   192.168.56.15
+db      IN  A   192.168.56.12
+ZONE
+
+      rc-update add named default
+      rc-service named start
+    SHELL
+  end
+
+  # ─── VM 3: ntp — NTP sobre UDP 123 ──────────────────────────────────────────
+  config.vm.define "ntp" do |n|
+    n.vm.box = ALPINE_BOX
+    n.vm.hostname = "kronos-ntp"
+    n.vm.network "private_network", ip: "192.168.56.12"
+    n.vm.provider "virtualbox" do |vb|
+      vb.memory = 256; vb.cpus = 1; vb.name = "ep5-ntp"
+    end
+    n.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache chrony
+
+      # Configurar como servidor NTP para la red local
+      cat > /etc/chrony/chrony.conf << 'NTP'
+# Sincronizar con servidores públicos
+pool pool.ntp.org iburst
+
+# Servir NTP a la red del lab
+allow 192.168.56.0/24
+
+# Permitir modo local si no hay acceso a internet
+local stratum 10
+
+makestep 1.0 3
+rtcsync
+NTP
+
+      rc-update add chronyd default
+      rc-service chronyd start
+    SHELL
+  end
+
+  # ─── VM 4: nfs — NFS sobre TCP/UDP 2049 ─────────────────────────────────────
+  config.vm.define "nfs" do |nf|
+    nf.vm.box = ALPINE_BOX
+    nf.vm.hostname = "kronos-nfs"
+    nf.vm.network "private_network", ip: "192.168.56.13"
+    nf.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep5-nfs"
+    end
+    nf.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nfs-utils
+
+      mkdir -p /srv/nfs/public
+      echo "Kronos NFS Export — Public Archive" > /srv/nfs/public/README.txt
+      echo "CONFIDENTIAL — For internal use only" > /srv/nfs/public/kronos-q4-report.txt
+      chown -R nobody:nobody /srv/nfs
+
+      # Exportar el directorio a la red del lab
+      echo '/srv/nfs/public 192.168.56.0/24(ro,sync,no_subtree_check,no_root_squash)' \
+        > /etc/exports
+
+      rc-update add rpcbind default
+      rc-update add nfs default
+      rc-service rpcbind start
+      rc-service nfs start
+      exportfs -a
+    SHELL
+  end
+
+  # ─── VM 5: acktgt — Target para ACK scan y NULL/FIN/Xmas scans ──────────────
+  # Demuestra la diferencia entre estados "filtered" (DROP) y "unfiltered" (REJECT/ACCEPT)
+  # en el contexto del ACK scan (-sA)
+  config.vm.define "acktgt" do |a|
+    a.vm.box = ALPINE_BOX
+    a.vm.hostname = "kronos-acktgt"
+    a.vm.network "private_network", ip: "192.168.56.14"
+    a.vm.provider "virtualbox" do |vb|
+      vb.memory = 256; vb.cpus = 1; vb.name = "ep5-acktgt"
+    end
+    a.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache iptables
+
+      # Firewall con reglas estáticas (sin state tracking) para demostrar ACK scan:
+      #   Puerto 22  → ACCEPT  → unfiltered (RST vuelve, host responde al ACK)
+      #   Puerto 80  → ACCEPT  → unfiltered
+      #   Puerto 443 → DROP    → filtered (silencio)
+      #   Puerto 8080 → REJECT  → unfiltered (ICMP unreachable)
+      #   Resto      → DROP    → filtered
+
+      iptables -F INPUT
+      iptables -A INPUT -i lo -j ACCEPT
+      # Sin -m state — firewall stateless intencional para el ejercicio
+      iptables -A INPUT -p icmp -j ACCEPT
+      iptables -A INPUT -p tcp --dport 22  -j ACCEPT
+      iptables -A INPUT -p tcp --dport 80  -j ACCEPT
+      iptables -A INPUT -p tcp --dport 443 -j DROP
+      iptables -A INPUT -p tcp --dport 8080 -j REJECT --reject-with icmp-port-unreachable
+      iptables -A INPUT -j DROP
+
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+      mkdir -p /etc/local.d
+      cat > /etc/local.d/iptables.start << 'LOCAL'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+LOCAL
+      chmod +x /etc/local.d/iptables.start
+      rc-update add local default
+    SHELL
+  end
+
+  # ─── VM 6: mixed — Múltiples servicios TCP en puertos estándar y no estándar ─
+  config.vm.define "mixed" do |m|
+    m.vm.box = ALPINE_BOX
+    m.vm.hostname = "kronos-mixed"
+    m.vm.network "private_network", ip: "192.168.56.15"
+    m.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep5-mixed"
+    end
+    m.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx openssl mariadb mariadb-client
+
+      # SSL cert
+      mkdir -p /etc/ssl/private /etc/ssl/certs
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx.key \
+        -out /etc/ssl/certs/nginx.crt \
+        -subj "/CN=kronos-mixed" 2>/dev/null
+
+      # nginx: HTTP (80), HTTPS (443), y puerto custom (8888, 9000)
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server {
+        listen 80;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+    server {
+        listen 443 ssl;
+        server_name _;
+        ssl_certificate /etc/ssl/certs/nginx.crt;
+        ssl_certificate_key /etc/ssl/private/nginx.key;
+        root /var/www/html;
+        index index.html;
+    }
+    server {
+        listen 8888;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+    server {
+        listen 9000;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+}
+NGINX
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Mixed Node</h1></body></html>' \
+        > /var/www/html/index.html
+      rc-update add nginx default
+      rc-service nginx start
+
+      # MariaDB (3306)
+      mysql_install_db --user=mysql --datadir=/var/lib/mysql --skip-name-resolve >/dev/null 2>&1
+      sed -i 's/^\s*skip-networking/#skip-networking/' /etc/my.cnf.d/mariadb-server.cnf
+      printf '\n[mysqld]\nbind-address=0.0.0.0\n' >> /etc/my.cnf.d/mariadb-server.cnf
+      rc-update add mariadb default
+      rc-service mariadb start
+    SHELL
+  end
+
+end

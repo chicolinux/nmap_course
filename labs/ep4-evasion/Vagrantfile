@@ -1,0 +1,239 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Episodio 4 — Sombras: El Arte de Moverse sin Ser Visto
+# 5 VMs que demuestran técnicas de evasión y sus contramedidas:
+#   honeypot   192.168.56.10 — ICMP responde (host "activo"), todo TCP/UDP DROPped
+#   ratelim    192.168.56.11 — SSH+HTTP, iptables con rate limiting (simula IDS)
+#   stealth    192.168.56.12 — Puerto 80 solo acepta paquetes con src_port=53
+#   normal1    192.168.56.13 — SSH+HTTP sin restricciones
+#   normal2    192.168.56.14 — SSH+FTP+HTTP:8080 sin restricciones
+
+ALPINE_BOX = "generic/alpine319"
+
+Vagrant.configure("2") do |config|
+
+  # ─── VM 1: honeypot — Responde a ICMP, todo lo demás DROPped ────────────────
+  # Enseña: un host "activo" puede tener todos sus puertos filtrados
+  # Blue team: los honeypots responden a pings pero no a conexiones reales
+  config.vm.define "honeypot" do |h|
+    h.vm.box = ALPINE_BOX
+    h.vm.hostname = "kronos-honeypot"
+    h.vm.network "private_network", ip: "192.168.56.10"
+    h.vm.provider "virtualbox" do |vb|
+      vb.memory = 256; vb.cpus = 1; vb.name = "ep4-honeypot"
+    end
+    h.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache iptables
+
+      # El honeypot responde a ICMP (el host parece vivo) pero dropea todo TCP/UDP
+      # Resultado en nmap: host UP, pero todos los puertos "filtered"
+      iptables -F INPUT
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      # SSH solo desde la interfaz NAT (eth0) para que Vagrant funcione
+      iptables -A INPUT -i eth0 -p tcp --dport 22 -j ACCEPT
+      # ICMP: permitir para que el host parezca "up"
+      iptables -A INPUT -p icmp -j ACCEPT
+      # Todo lo demás: DROP (filtered)
+      iptables -A INPUT -j DROP
+
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+      mkdir -p /etc/local.d
+      cat > /etc/local.d/iptables.start << 'LOCAL'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+LOCAL
+      chmod +x /etc/local.d/iptables.start
+      rc-update add local default
+    SHELL
+  end
+
+  # ─── VM 2: ratelim — Rate limiting que simula un IDS ────────────────────────
+  # Enseña: iptables puede limitar la velocidad de conexiones por segundo
+  # Un scan rápido (-T4/-T5) será bloqueado; un scan lento (-T1/-T0) pasará
+  config.vm.define "ratelim" do |r|
+    r.vm.box = ALPINE_BOX
+    r.vm.hostname = "kronos-ratelim"
+    r.vm.network "private_network", ip: "192.168.56.11"
+    r.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep4-ratelim"
+    end
+    r.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx iptables
+
+      # nginx
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Secure Node</h1></body></html>' \
+        > /var/www/html/index.html
+      cat > /etc/nginx/http.d/default.conf << 'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}
+NGINX
+      rc-update add nginx default
+      rc-service nginx start
+
+      # Rate limiting: máximo 15 nuevas conexiones TCP por segundo desde una misma IP
+      # Un scan -T4 de nmap supera fácilmente este límite y los paquetes se dropean
+      iptables -F INPUT
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      iptables -A INPUT -p icmp -j ACCEPT
+      # SSH sin rate limit (Vagrant lo necesita)
+      iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+      # Resto del tráfico TCP con rate limiting
+      iptables -A INPUT -p tcp -m state --state NEW \
+        -m limit --limit 15/sec --limit-burst 20 -j ACCEPT
+      iptables -A INPUT -p tcp -m state --state NEW -j DROP
+
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+      mkdir -p /etc/local.d
+      cat > /etc/local.d/iptables.start << 'LOCAL'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+LOCAL
+      chmod +x /etc/local.d/iptables.start
+      rc-update add local default
+    SHELL
+  end
+
+  # ─── VM 3: stealth — Puerto 80 solo acepta paquetes con source port 53 ──────
+  # Enseña: algunos firewalls mal configurados permiten tráfico si viene del
+  # puerto 53 (DNS), asumiendo que es tráfico legítimo. Técnica: --source-port
+  config.vm.define "stealth" do |s|
+    s.vm.box = ALPINE_BOX
+    s.vm.hostname = "kronos-stealth"
+    s.vm.network "private_network", ip: "192.168.56.12"
+    s.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep4-stealth"
+    end
+    s.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx iptables
+
+      mkdir -p /var/www/html
+      cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html>
+<html><body>
+  <h1>Kronos Stealth Node</h1>
+  <p>Si puedes leer esto, encontraste la vulnerabilidad de configuración.</p>
+</body></html>
+HTML
+      cat > /etc/nginx/http.d/default.conf << 'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}
+NGINX
+      rc-update add nginx default
+      rc-service nginx start
+
+      # Regla de firewall mal configurada:
+      # Puerto 80 SOLO acepta conexiones que vengan del source port 53 (DNS)
+      # Un admin pensó: "si viene del puerto DNS, debe ser legítimo"
+      iptables -F INPUT
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      iptables -A INPUT -p icmp -j ACCEPT
+      iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+      # Solo acepta conexiones a 80 si el source port es 53
+      iptables -A INPUT -p tcp --dport 80 --sport 53 -j ACCEPT
+      iptables -A INPUT -p tcp --dport 80 -j DROP
+      iptables -A INPUT -j DROP
+
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+      mkdir -p /etc/local.d
+      cat > /etc/local.d/iptables.start << 'LOCAL'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+LOCAL
+      chmod +x /etc/local.d/iptables.start
+      rc-update add local default
+    SHELL
+  end
+
+  # ─── VM 4: normal1 — Host sin restricciones (control) ──────────────────────
+  config.vm.define "normal1" do |n1|
+    n1.vm.box = ALPINE_BOX
+    n1.vm.hostname = "kronos-normal1"
+    n1.vm.network "private_network", ip: "192.168.56.13"
+    n1.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep4-normal1"
+    end
+    n1.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache nginx
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Node Alpha</h1></body></html>' \
+        > /var/www/html/index.html
+      cat > /etc/nginx/http.d/default.conf << 'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}
+NGINX
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+
+  # ─── VM 5: normal2 — Host con múltiples servicios (control) ─────────────────
+  config.vm.define "normal2" do |n2|
+    n2.vm.box = ALPINE_BOX
+    n2.vm.hostname = "kronos-normal2"
+    n2.vm.network "private_network", ip: "192.168.56.14"
+    n2.vm.provider "virtualbox" do |vb|
+      vb.memory = 512; vb.cpus = 1; vb.name = "ep4-normal2"
+    end
+    n2.vm.provision "shell", inline: <<~SHELL
+      apk update && apk add --no-cache vsftpd nginx
+
+      # FTP
+      mkdir -p /var/ftp/pub
+      echo "Kronos File Archive" > /var/ftp/pub/README.txt
+      cat > /etc/vsftpd/vsftpd.conf << 'FTP'
+listen=YES
+anonymous_enable=YES
+local_enable=NO
+write_enable=NO
+anon_root=/var/ftp/pub
+FTP
+      rc-update add vsftpd default
+      rc-service vsftpd start
+
+      # nginx en 8080
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server {
+        listen 8080;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+    }
+}
+NGINX
+      mkdir -p /var/www/html
+      echo '<html><body><h1>Kronos Node Beta — Port 8080</h1></body></html>' \
+        > /var/www/html/index.html
+      rc-update add nginx default
+      rc-service nginx start
+    SHELL
+  end
+
+end
